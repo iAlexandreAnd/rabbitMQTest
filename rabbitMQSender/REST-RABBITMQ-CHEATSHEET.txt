@@ -1,0 +1,192 @@
+RabbitMQ REST Sender - Cheatsheet
+=================================
+
+Goal
+----
+Expose an HTTP POST endpoint that accepts JSON, publishes its message to
+RabbitMQ, and returns HTTP 202 Accepted after the publish call completes.
+
+Suggested project layout
+------------------------
+rabbitMQSender/
+  Contracts/
+    PublishMessageRequest.cs
+  Messaging/
+    IMessagePublisher.cs
+    RabbitMqPublisher.cs
+  Program.cs
+  rabbitMQSender.csproj
+  rabbitMQSender.http
+
+Important project setup
+-----------------------
+The current sender uses Microsoft.NET.Sdk (console app). To host ASP.NET Core,
+change its SDK to Microsoft.NET.Sdk.Web when you implement this example.
+Keep the existing RabbitMQ.Client 7.2.2 package reference.
+
+Keep the exchange, queue, and routing key consistent with the receiver:
+  Exchange:   test_exchange
+  Queue:      test_queue
+  Routing key:test_routing_key
+
+The examples below use non-durable topology to match the current receiver.
+For durable messages, make the exchange and queue durable on BOTH sender and
+receiver, publish persistent messages, and enable publisher confirms.
+
+1. Program.cs
+-------------
+using RabbitMQ.Client;
+using rabbitMQSender.Contracts;
+using rabbitMQSender.Messaging;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddProblemDetails();
+
+var rabbitUri = builder.Configuration["RabbitMq:Uri"]
+    ?? "amqp://guest:guest@localhost:5672/";
+var factory = new ConnectionFactory
+{
+    Uri = new Uri(rabbitUri),
+    ClientProvidedName = "Rabbit sender API"
+};
+
+// Keep one connection and channel for the application's lifetime.
+await using var connection = await factory.CreateConnectionAsync();
+await using var channel = await connection.CreateChannelAsync();
+
+const string exchange = "test_exchange";
+const string routingKey = "test_routing_key";
+const string queue = "test_queue";
+
+await channel.ExchangeDeclareAsync(exchange, ExchangeType.Direct);
+await channel.QueueDeclareAsync(queue, durable: false, exclusive: false,
+    autoDelete: false, arguments: null);
+await channel.QueueBindAsync(queue, exchange, routingKey);
+
+builder.Services.AddSingleton<IMessagePublisher>(
+    new RabbitMqPublisher(channel, exchange, routingKey));
+
+var app = builder.Build();
+app.UseExceptionHandler();
+app.UseStatusCodePages();
+
+app.MapPost("/api/messages", async Task<Results<Accepted, ValidationProblem>> (
+    PublishMessageRequest request,
+    IMessagePublisher publisher,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Message) || request.Message.Length > 4000)
+    {
+        return TypedResults.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["message"] = ["Message must be between 1 and 4000 characters."]
+        });
+    }
+
+    await publisher.PublishAsync(request.Message, cancellationToken);
+    return TypedResults.Accepted();
+})
+.WithName("PublishMessage")
+.WithSummary("Publish a message to RabbitMQ")
+.WithDescription("Accepts a JSON message and publishes it to the configured queue.")
+.Produces(StatusCodes.Status202Accepted)
+.ProducesValidationProblem();
+
+await app.RunAsync();
+
+2. Contracts/PublishMessageRequest.cs
+-------------------------------------
+namespace rabbitMQSender.Contracts;
+
+/// <summary>Message body submitted to the RabbitMQ publish endpoint.</summary>
+public sealed record PublishMessageRequest(string Message);
+
+3. Messaging/IMessagePublisher.cs
+---------------------------------
+namespace rabbitMQSender.Messaging;
+
+public interface IMessagePublisher
+{
+    Task PublishAsync(string message, CancellationToken cancellationToken);
+}
+
+4. Messaging/RabbitMqPublisher.cs
+---------------------------------
+using System.Text;
+using RabbitMQ.Client;
+
+namespace rabbitMQSender.Messaging;
+
+public sealed class RabbitMqPublisher(
+    IChannel channel,
+    string exchange,
+    string routingKey) : IMessagePublisher
+{
+    // A channel is not safe for simultaneous publishing. Serialize publishes
+    // when a singleton channel is shared by concurrent REST requests.
+    private readonly SemaphoreSlim _publishLock = new(1, 1);
+
+    public async Task PublishAsync(
+        string message,
+        CancellationToken cancellationToken)
+    {
+        var body = Encoding.UTF8.GetBytes(message);
+        await _publishLock.WaitAsync(cancellationToken);
+        try
+        {
+            await channel.BasicPublishAsync(
+                exchange: exchange,
+                routingKey: routingKey,
+                mandatory: false,
+                basicProperties: new BasicProperties(),
+                body: body,
+                cancellationToken: cancellationToken);
+        }
+        finally
+        {
+            _publishLock.Release();
+        }
+    }
+}
+
+5. rabbitMQSender.http
+----------------------
+@baseUrl = http://localhost:5000
+
+### Publish a message
+POST {{baseUrl}}/api/messages
+Content-Type: application/json
+
+{
+  "message": "Hello from a REST call"
+}
+
+Expected response: 202 Accepted
+
+Run and test
+------------
+1. Start RabbitMQ and ensure the URI points to the broker.
+2. Start the sender with: dotnet run --project rabbitMQSender
+3. Send the HTTP request using the .http file, curl, or an API client.
+4. Confirm the receiver logs the published message.
+
+Example curl command:
+curl -X POST http://localhost:5000/api/messages ^
+  -H "Content-Type: application/json" ^
+  -d "{\"message\":\"Hello from REST\"}"
+
+Configuration and reliability notes
+------------------------------------
+- Keep credentials out of source-controlled appsettings files. Use environment
+  variables or a secret store for real credentials. The guest/guest URI above
+  is only a local-development default; RabbitMQ guest access is generally
+  restricted to localhost.
+- The sender opens its RabbitMQ connection during startup. If the broker is
+  unavailable, startup fails rather than silently pretending messages were sent.
+- The shared channel is protected by a semaphore because multiple HTTP requests
+  can arrive concurrently.
+- HTTP 202 means the publish call completed; without publisher confirms it is
+  not a guarantee that the broker durably stored or routed the message.
+- The current receiver declares non-durable exchange/queue topology. Any
+  durability changes must be made consistently at both ends.
+- Avoid Thread.Sleep in the request path; await asynchronous work instead.
